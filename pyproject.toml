@@ -1,0 +1,40 @@
+[project]
+name = "am2sp"
+version = "0.1.0"
+description = "Migrate an Apple Music library export to Spotify (CLI + TUI)"
+readme = "README.md"
+authors = [
+    { name = "Renaud Bruyeron", email = "bruyeron@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "httpx>=0.28.1",
+    "rapidfuzz>=3.14.6",
+    "rich>=15.0.0",
+    "textual>=8.2.8",
+    "typer>=0.27.3",
+]
+
+[project.scripts]
+am2sp = "am2sp.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.13.6,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "respx>=0.23.1",
+    "ruff>=0.17.4",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "N"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
