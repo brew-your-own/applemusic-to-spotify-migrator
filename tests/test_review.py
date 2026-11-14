@@ -100,3 +100,18 @@ def test_review_albums(tmp_path, library):
     m = store.load_album_matches()[ALBUM_KEY]
     assert m.status == "manual" and m.uri == "spotify:album:rc"
     assert store.load_matches() == {}  # track matches untouched
+
+
+def test_bracketed_album_names_are_not_eaten_as_markup(tmp_path, library):
+    store = _setup(tmp_path, library)
+    c = Candidate("spotify:track:7", "Clair de lune", ["Someone"], "Moonlight Classics", 288000, 0.74)
+    store.save_matches({"A3": Match(status="ambiguous", score=0.74, candidates=[c])})
+
+    async def run():
+        app = ReviewApp(store)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            ol = app.query_one("#candidates")
+            assert "[Moonlight Classics]" in str(ol.get_option_at_index(0).prompt)
+
+    asyncio.run(run())

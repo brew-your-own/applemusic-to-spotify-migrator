@@ -12,6 +12,7 @@ uv run pytest                             # all tests (offline; Spotify is mocke
 uv run pytest tests/test_matching.py::test_exact_match_scores_high   # single test
 uv run ruff check --fix . && uv run ruff format .
 uv run am2sp --help                       # CLI entry point: am2sp.cli:app
+uv run python scripts/screenshots.py     # regenerate README screenshots (docs/screenshots/) from invented demo data
 ```
 
 ## Architecture

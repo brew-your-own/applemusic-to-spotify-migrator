@@ -9,6 +9,8 @@ from __future__ import annotations
 import re
 from typing import Any, Literal
 
+from rich.markup import escape
+from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -23,6 +25,10 @@ from .store import Store
 REVIEW_STATUSES = {"ambiguous", "not_found"}
 _TRACK_RE = re.compile(r"(?:spotify:track:|open\.spotify\.com/(?:intl-\w+/)?track/)([A-Za-z0-9]{22})")
 _ALBUM_RE = re.compile(r"(?:spotify:album:|open\.spotify\.com/(?:intl-\w+/)?album/)([A-Za-z0-9]{22})")
+
+
+def _clip(s: str, n: int) -> Text:
+    return Text(s if len(s) <= n else s[: n - 1] + "…")
 
 
 def _fmt_ms(ms: int | None) -> str:
@@ -56,9 +62,9 @@ class _Tracks:
     def detail(self, key: str) -> str:
         tr = self.lib.tracks[key]
         return (
-            f"[b]{tr.name}[/b]\n{tr.artist}"
-            + (f"  ·  composer: {tr.composer}" if tr.composer else "")
-            + f"\n[i]{tr.album}[/i]  ({_fmt_ms(tr.duration_ms)})"
+            f"[b]{escape(tr.name)}[/b]\n{escape(tr.artist)}"
+            + (f"  ·  composer: {escape(tr.composer)}" if tr.composer else "")
+            + f"\n[i]{escape(tr.album)}[/i]  ({_fmt_ms(tr.duration_ms)})"
         )
 
     def default_query(self, key: str) -> str:
@@ -97,8 +103,10 @@ class _Albums:
     def detail(self, key: str) -> str:
         a = self.albums[key]
         total = f"{len(a.tracks)}/{a.track_count}" if a.track_count else str(len(a.tracks))
-        lines = [f"[b]{a.name}[/b]", a.artist, f"[i]{a.year or '?'} · {total} tracks saved[/i]", ""]
-        lines += [f"  {t.track_number or '·':>2}. {t.name[:70]} ({_fmt_ms(t.duration_ms)})" for t in a.tracks[:8]]
+        lines = [f"[b]{escape(a.name)}[/b]", escape(a.artist), f"[i]{a.year or '?'} · {total} tracks saved[/i]", ""]
+        lines += [
+            f"  {t.track_number or '·':>2}. {escape(t.name[:70])} ({_fmt_ms(t.duration_ms)})" for t in a.tracks[:8]
+        ]
         if len(a.tracks) > 8:
             lines.append(f"  … {len(a.tracks) - 8} more")
         return "\n".join(lines)
@@ -119,8 +127,8 @@ class _Albums:
 class ReviewApp(App[None]):
     TITLE = "am2sp — review matches"
     CSS = """
-    #tracks { width: 45%; }
-    #right { width: 55%; padding: 0 1; }
+    #tracks { width: 50%; }
+    #right { width: 50%; padding: 0 1; }
     #detail { height: auto; padding: 1 0; }
     #candidates { height: 1fr; }
     #search { display: none; }
@@ -193,7 +201,7 @@ class ReviewApp(App[None]):
         for key in rows:
             title, artist = self.src.row(key)
             m = self.matches[key]
-            t.add_row(m.status, f"{m.score:.2f}", title[:50], artist[:30], key=key)
+            t.add_row(m.status, f"{m.score:.2f}", _clip(title, 26), _clip(artist, 16), key=key)
         todo = sum(1 for k in self.src.keys() if self.needs_review(self.matches.get(k)))
         checking = f" · incl. auto < {self.check_below:.2f}" if self.check_below is not None else ""
         self.sub_title = f"{todo} to review{checking}" + (" · showing all" if self.show_all else "")
@@ -213,13 +221,13 @@ class ReviewApp(App[None]):
         self.query_one("#detail", Static).update(
             self.src.detail(key)
             + f"\n\nstatus: [b]{m.status}[/b]"
-            + (f"  →  {chosen.label}" if chosen else (f"  →  {m.uri}" if m.uri else ""))
+            + (f"  →  {escape(chosen.label)}" if chosen else (f"  →  {m.uri}" if m.uri else ""))
         )
         ol = self.query_one("#candidates", OptionList)
         ol.clear_options()
         for c in m.candidates:
             mark = "✓ " if c.uri == m.uri else "  "
-            ol.add_option(Option(f"{mark}{c.score:.2f}  {c.label}", id=c.uri))
+            ol.add_option(Option(Text(f"{mark}{c.score:.2f}  {c.label}"), id=c.uri))
         if not m.candidates:
             ol.add_option(Option("(no candidates — press / to search)", disabled=True))
         else:

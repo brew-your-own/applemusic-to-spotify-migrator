@@ -41,8 +41,8 @@ def parse_track(d: dict[str, Any]) -> Track:
     )
 
 
-# Playlists left out by default. "Spotify Liked Songs" is what an earlier Spotify → Apple Music move created
-# from the Spotify likes; pushing it back would only duplicate Liked Songs as a playlist.
+# Playlists left out by default. Tools that move Spotify likes to Apple Music create a "Spotify Liked Songs"
+# playlist; pushing it back to Spotify would only duplicate Liked Songs as a playlist.
 DEFAULT_SKIP_PLAYLISTS = ("Spotify Liked Songs",)
 
 
