@@ -2,8 +2,17 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
+
+MIN_ALBUM_TRACKS = 3  # this many saved tracks from one album → the album is a target (saved as an album)
+
+
+def album_key(t: Track) -> str:
+    """Groups saved tracks into albums: folded album artist (or artist) + album name."""
+    return f"{(t.album_artist or t.artist).strip().lower()}|{t.album.strip().lower()}"
+
 
 MatchStatus = Literal["auto", "manual", "ambiguous", "not_found", "skipped"]
 RESOLVED: frozenset[str] = frozenset({"auto", "manual"})
@@ -21,6 +30,8 @@ class Track:
     composer: str = ""
     duration_ms: int | None = None
     track_number: int | None = None
+    track_count: int | None = None  # tracks on the album, per Apple
+    disc_number: int | None = None
     year: int | None = None
     date_added: str | None = None  # ISO-8601; only set for tracks in the library proper
     in_library: bool = False  # False for "Playlist Only" tracks
@@ -66,20 +77,68 @@ class Library:
         )
 
     def wanted_pids(self) -> list[str]:
-        """Every track pid that some push target (library or a playlist) needs, in stable order."""
-        pids = [t.pid for t in self.library_tracks()]
-        for p in self.playlists:
-            pids.extend(p.track_pids)
-        return list(dict.fromkeys(pids))
+        """Every track pid that needs a track-level match: the playlist tracks, in stable order.
 
-    def library_tracks(self) -> list[Track]:
-        """Tracks saved to the library, oldest first (so newest ends up on top in Spotify)."""
-        lib = [t for t in self.tracks.values() if t.in_library and not t.is_video]
-        return sorted(lib, key=lambda t: t.date_added or "")
+        Saved albums are matched as albums (see `albums()`), and loose library tracks are not migrated.
+        """
+        return list(dict.fromkeys(pid for p in self.playlists for pid in p.track_pids))
+
+    def _saved_tracks(self) -> list[Track]:
+        return [t for t in self.tracks.values() if t.in_library and not t.is_video]
+
+    def albums(self) -> list[Album]:
+        """Albums saved in Apple Music: >= MIN_ALBUM_TRACKS library tracks sharing album artist + album name."""
+        groups: dict[str, list[Track]] = {}
+        for t in self._saved_tracks():
+            if t.album.strip():
+                groups.setdefault(album_key(t), []).append(t)
+        out = []
+        for key, ts in groups.items():
+            if len(ts) < MIN_ALBUM_TRACKS:
+                continue
+            ts.sort(key=lambda t: (t.disc_number or 1, t.track_number or 0))
+            artist = ts[0].album_artist or Counter(t.artist for t in ts).most_common(1)[0][0]
+            out.append(
+                Album(
+                    key=key,
+                    name=ts[0].album,
+                    artist=artist,
+                    year=max((t.year for t in ts if t.year), default=None),
+                    track_count=max((t.track_count for t in ts if t.track_count), default=None),
+                    tracks=ts,
+                    date_added=min((t.date_added for t in ts if t.date_added), default=None),
+                )
+            )
+        return sorted(out, key=lambda a: a.date_added or "")
+
+    def solo_tracks(self) -> list[Track]:
+        """Library tracks that are neither part of a saved album nor in a playlist: not migrated."""
+        in_album = {t.pid for a in self.albums() for t in a.tracks}
+        in_playlist = {pid for p in self.playlists for pid in p.track_pids}
+        return [t for t in self._saved_tracks() if t.pid not in in_album and t.pid not in in_playlist]
+
+
+@dataclass
+class Album:
+    """An album saved in Apple Music, derived from its library tracks (not persisted; see `Library.albums`)."""
+
+    key: str
+    name: str
+    artist: str
+    year: int | None
+    track_count: int | None
+    tracks: list[Track]
+    date_added: str | None = None
+
+    @property
+    def composers(self) -> str:
+        return " ".join(dict.fromkeys(t.composer for t in self.tracks if t.composer))
 
 
 @dataclass
 class Candidate:
+    """A Spotify track (or, for album matches, a Spotify album: `album` then holds "year · N tracks · …")."""
+
     uri: str
     name: str
     artists: list[str]
@@ -89,8 +148,11 @@ class Candidate:
 
     @property
     def label(self) -> str:
+        base = f"{self.name} — {', '.join(self.artists)} [{self.album}]"
+        if not self.duration_ms:
+            return base
         secs = self.duration_ms // 1000
-        return f"{self.name} — {', '.join(self.artists)} [{self.album}] ({secs // 60}:{secs % 60:02d})"
+        return f"{base} ({secs // 60}:{secs % 60:02d})"
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Candidate:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import plistlib
+from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -30,6 +31,8 @@ def parse_track(d: dict[str, Any]) -> Track:
         composer=d.get("Composer", ""),
         duration_ms=d.get("Total Time"),
         track_number=d.get("Track Number"),
+        track_count=d.get("Track Count"),
+        disc_number=d.get("Disc Number"),
         year=d.get("Year"),
         date_added=_iso(d.get("Date Added")),
         in_library=not d.get("Playlist Only", False),
@@ -38,7 +41,12 @@ def parse_track(d: dict[str, Any]) -> Track:
     )
 
 
-def load_library(src: Path | BinaryIO) -> Library:
+# Playlists left out by default. "Spotify Liked Songs" is what an earlier Spotify → Apple Music move created
+# from the Spotify likes; pushing it back would only duplicate Liked Songs as a playlist.
+DEFAULT_SKIP_PLAYLISTS = ("Spotify Liked Songs",)
+
+
+def load_library(src: Path | BinaryIO, skip_playlists: Iterable[str] = ()) -> Library:
     if isinstance(src, Path):
         with src.open("rb") as f:
             raw = plistlib.load(f)
@@ -49,9 +57,10 @@ def load_library(src: Path | BinaryIO) -> Library:
     for d in raw.get("Tracks", {}).values():
         by_id[d["Track ID"]] = parse_track(d)
 
+    skip = {n.casefold() for n in skip_playlists}
     playlists: list[Playlist] = []
     for p in raw.get("Playlists", []):
-        if _is_system_playlist(p):
+        if _is_system_playlist(p) or p.get("Name", "").casefold() in skip:
             continue
         pids = [
             by_id[item["Track ID"]].pid

@@ -1,7 +1,8 @@
 """On-disk state for each stage, so runs are resumable and inspectable.
 
 <state_dir>/library.json  extract output (normalized Library)
-<state_dir>/matches.json  Apple track pid → Match
+<state_dir>/matches.json  Apple track pid → Match (playlist tracks)
+<state_dir>/albums.json   Apple album key → Match (candidates are Spotify albums)
 <state_dir>/push.json     what has already been written to Spotify (makes `push` idempotent)
 """
 
@@ -48,9 +49,15 @@ class Store:
     def save_matches(self, matches: dict[str, Match]) -> None:
         _write(self.root / "matches.json", {k: m.to_dict() for k, m in matches.items()})
 
+    def load_album_matches(self) -> dict[str, Match]:
+        return {k: Match.from_dict(v) for k, v in _read(self.root / "albums.json", {}).items()}
+
+    def save_album_matches(self, matches: dict[str, Match]) -> None:
+        _write(self.root / "albums.json", {k: m.to_dict() for k, m in matches.items()})
+
     def load_push(self) -> dict[str, Any]:
         data = _read(self.root / "push.json", {})
-        data.setdefault("library", [])
+        data.setdefault("albums", [])
         data.setdefault("playlists", {})
         return data
 

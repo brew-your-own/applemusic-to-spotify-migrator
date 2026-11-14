@@ -1,9 +1,13 @@
-"""Textual TUI for reviewing ambiguous / not-found matches. Every action is saved immediately."""
+"""Textual TUI for reviewing matches: playlist tracks (default) or saved albums (`kind="albums"`).
+
+Lists ambiguous / not-found items and, with `check_below`, low-scoring auto matches. Every action is saved
+immediately. Accepting or skipping an item sets `manual`/`skipped`, which takes it off the list.
+"""
 
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Literal
 
 from textual import on, work
 from textual.app import App, ComposeResult
@@ -13,11 +17,12 @@ from textual.widgets import DataTable, Footer, Header, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
 from . import matching
-from .models import Library, Match, Track
+from .models import Album, Candidate, Match
 from .store import Store
 
 REVIEW_STATUSES = {"ambiguous", "not_found"}
-_URI_RE = re.compile(r"(?:spotify:track:|open\.spotify\.com/(?:intl-\w+/)?track/)([A-Za-z0-9]{22})")
+_TRACK_RE = re.compile(r"(?:spotify:track:|open\.spotify\.com/(?:intl-\w+/)?track/)([A-Za-z0-9]{22})")
+_ALBUM_RE = re.compile(r"(?:spotify:album:|open\.spotify\.com/(?:intl-\w+/)?album/)([A-Za-z0-9]{22})")
 
 
 def _fmt_ms(ms: int | None) -> str:
@@ -25,6 +30,90 @@ def _fmt_ms(ms: int | None) -> str:
         return "?:??"
     s = ms // 1000
     return f"{s // 60}:{s % 60:02d}"
+
+
+class _Tracks:
+    """Playlist tracks, keyed by Apple track pid."""
+
+    noun = "tracks"
+    placeholder = "Spotify search query, or paste a track URL/URI"
+
+    def __init__(self, store: Store):
+        self.lib = store.load_library()
+        self.matches = store.load_matches()
+        self._save = store.save_matches
+
+    def save(self) -> None:
+        self._save(self.matches)
+
+    def keys(self) -> list[str]:
+        return self.lib.wanted_pids()
+
+    def row(self, key: str) -> tuple[str, str]:
+        tr = self.lib.tracks[key]
+        return tr.name, tr.artist
+
+    def detail(self, key: str) -> str:
+        tr = self.lib.tracks[key]
+        return (
+            f"[b]{tr.name}[/b]\n{tr.artist}"
+            + (f"  ·  composer: {tr.composer}" if tr.composer else "")
+            + f"\n[i]{tr.album}[/i]  ({_fmt_ms(tr.duration_ms)})"
+        )
+
+    def default_query(self, key: str) -> str:
+        tr = self.lib.tracks[key]
+        return f"{matching.clean_title(tr.name)} {matching.primary_artist(tr.artist)}".strip()
+
+    def search(self, sp: Any, key: str, q: str) -> list[Candidate]:
+        tr = self.lib.tracks[key]
+        results = [sp.get_track(m.group(1))] if (m := _TRACK_RE.search(q)) else sp.search_tracks(q)
+        previous = [matching.candidate_as_result(c) for c in self.matches[key].candidates]
+        return matching.rank(tr, results + previous, keep=12)
+
+
+class _Albums:
+    """Saved Apple albums, keyed by `Album.key`."""
+
+    noun = "albums"
+    placeholder = "Spotify album search query, or paste an album URL/URI"
+
+    def __init__(self, store: Store):
+        self.lib = store.load_library()
+        self.albums: dict[str, Album] = {a.key: a for a in self.lib.albums()}
+        self.matches = store.load_album_matches()
+        self._save = store.save_album_matches
+
+    def save(self) -> None:
+        self._save(self.matches)
+
+    def keys(self) -> list[str]:
+        return list(self.albums)
+
+    def row(self, key: str) -> tuple[str, str]:
+        a = self.albums[key]
+        return a.name, a.artist
+
+    def detail(self, key: str) -> str:
+        a = self.albums[key]
+        total = f"{len(a.tracks)}/{a.track_count}" if a.track_count else str(len(a.tracks))
+        lines = [f"[b]{a.name}[/b]", a.artist, f"[i]{a.year or '?'} · {total} tracks saved[/i]", ""]
+        lines += [f"  {t.track_number or '·':>2}. {t.name[:70]} ({_fmt_ms(t.duration_ms)})" for t in a.tracks[:8]]
+        if len(a.tracks) > 8:
+            lines.append(f"  … {len(a.tracks) - 8} more")
+        return "\n".join(lines)
+
+    def default_query(self, key: str) -> str:
+        a = self.albums[key]
+        return f"{matching.clean_album(a.name)} {matching.primary_artist(a.artist)}".strip()
+
+    def search(self, sp: Any, key: str, q: str) -> list[Candidate]:
+        a = self.albums[key]
+        results = [sp.get_album(m.group(1))] if (m := _ALBUM_RE.search(q)) else sp.search_albums(q)
+        fresh = matching.album_search_candidates(a, results)
+        seen = {c.uri for c in fresh}
+        merged = fresh + [c for c in self.matches[key].candidates if c.uri not in seen]
+        return sorted(merged, key=lambda c: c.score, reverse=True)[:12]
 
 
 class ReviewApp(App[None]):
@@ -47,14 +136,24 @@ class ReviewApp(App[None]):
         Binding("q", "quit", "Quit"),
     ]
 
-    def __init__(self, store: Store, spotify: Any | None = None):
+    def __init__(
+        self,
+        store: Store,
+        spotify: Any | None = None,
+        check_below: float | None = None,
+        kind: Literal["tracks", "albums"] = "tracks",
+    ):
         super().__init__()
-        self.store = store
+        self.src: _Tracks | _Albums = _Albums(store) if kind == "albums" else _Tracks(store)
         self.sp = spotify
-        self.lib: Library = store.load_library()
-        self.matches: dict[str, Match] = store.load_matches()
+        self.check_below = check_below
         self.show_all = False
         self.current: str | None = None
+        self.title = f"am2sp — review {self.src.noun}"
+
+    @property
+    def matches(self) -> dict[str, Match]:
+        return self.src.matches
 
     # --- layout -------------------------------------------------------------
 
@@ -64,7 +163,7 @@ class ReviewApp(App[None]):
             yield DataTable(id="tracks", cursor_type="row", zebra_stripes=True)
             with Vertical(id="right"):
                 yield Static(id="detail")
-                yield Input(placeholder="Spotify search query, or paste a track URL/URI", id="search")
+                yield Input(placeholder=self.src.placeholder, id="search")
                 yield OptionList(id="candidates")
         yield Footer()
 
@@ -74,40 +173,47 @@ class ReviewApp(App[None]):
         self.refresh_table()
         t.focus()
 
+    def needs_review(self, m: Match | None) -> bool:
+        if m is None:
+            return False
+        if m.status in REVIEW_STATUSES:
+            return True
+        return self.check_below is not None and m.status == "auto" and m.score < self.check_below
+
     def _rows(self) -> list[str]:
-        pids = self.lib.wanted_pids()
+        keys = self.src.keys()
         if self.show_all:
-            return [p for p in pids if p in self.matches]
-        return [p for p in pids if self.matches.get(p) and self.matches[p].status in REVIEW_STATUSES]
+            return [k for k in keys if k in self.matches]
+        return [k for k in keys if self.needs_review(self.matches.get(k))]
 
     def refresh_table(self, keep: str | None = None) -> None:
         t = self.query_one("#tracks", DataTable)
         t.clear()
         rows = self._rows()
-        for pid in rows:
-            tr, m = self.lib.tracks[pid], self.matches[pid]
-            t.add_row(m.status, f"{m.score:.2f}", tr.name[:50], tr.artist[:30], key=pid)
-        todo = sum(1 for m in self.matches.values() if m.status in REVIEW_STATUSES)
-        self.sub_title = f"{todo} to review" + (" · showing all" if self.show_all else "")
+        for key in rows:
+            title, artist = self.src.row(key)
+            m = self.matches[key]
+            t.add_row(m.status, f"{m.score:.2f}", title[:50], artist[:30], key=key)
+        todo = sum(1 for k in self.src.keys() if self.needs_review(self.matches.get(k)))
+        checking = f" · incl. auto < {self.check_below:.2f}" if self.check_below is not None else ""
+        self.sub_title = f"{todo} to review{checking}" + (" · showing all" if self.show_all else "")
         if keep in rows:
             t.move_cursor(row=rows.index(keep))
         elif rows:
-            self.show_track(rows[min(t.cursor_row, len(rows) - 1)])
+            self.show_item(rows[min(t.cursor_row, len(rows) - 1)])
         else:
             self.current = None
             self.query_one("#detail", Static).update("Nothing to review. Press [b]a[/b] to show all, [b]q[/b] to quit.")
             self.query_one("#candidates", OptionList).clear_options()
 
-    def show_track(self, pid: str) -> None:
-        self.current = pid
-        tr: Track = self.lib.tracks[pid]
-        m = self.matches[pid]
+    def show_item(self, key: str) -> None:
+        self.current = key
+        m = self.matches[key]
         chosen = next((c for c in m.candidates if c.uri == m.uri), None)
         self.query_one("#detail", Static).update(
-            f"[b]{tr.name}[/b]\n{tr.artist}"
-            + (f"  ·  composer: {tr.composer}" if tr.composer else "")
-            + f"\n[i]{tr.album}[/i]  ({_fmt_ms(tr.duration_ms)})\n\n"
-            f"status: [b]{m.status}[/b]" + (f"  →  {chosen.label}" if chosen else (f"  →  {m.uri}" if m.uri else ""))
+            self.src.detail(key)
+            + f"\n\nstatus: [b]{m.status}[/b]"
+            + (f"  →  {chosen.label}" if chosen else (f"  →  {m.uri}" if m.uri else ""))
         )
         ol = self.query_one("#candidates", OptionList)
         ol.clear_options()
@@ -124,7 +230,7 @@ class ReviewApp(App[None]):
     @on(DataTable.RowHighlighted, "#tracks")
     def _row(self, ev: DataTable.RowHighlighted) -> None:
         if ev.row_key and ev.row_key.value:
-            self.show_track(ev.row_key.value)
+            self.show_item(ev.row_key.value)
 
     @on(DataTable.RowSelected, "#tracks")
     def _row_enter(self, ev: DataTable.RowSelected) -> None:
@@ -146,28 +252,22 @@ class ReviewApp(App[None]):
             self.run_search(self.current, q)
 
     @work(thread=True, exclusive=True)
-    def run_search(self, pid: str, q: str) -> None:
+    def run_search(self, key: str, q: str) -> None:
         if self.sp is None:
             self.call_from_thread(self.notify, "Not logged in to Spotify (run `am2sp auth`).", severity="error")
             return
-        tr = self.lib.tracks[pid]
         try:
-            if m := _URI_RE.search(q):
-                results = [self.sp.get_track(m.group(1))]
-            else:
-                results = self.sp.search_tracks(q)
+            candidates = self.src.search(self.sp, key, q)
         except Exception as e:  # surface API errors in the UI, don't crash it
             self.call_from_thread(self.notify, str(e), severity="error")
             return
-        match = self.matches[pid]
-        previous = [matching.candidate_as_result(c) for c in match.candidates]
-        match.candidates = matching.rank(tr, results + previous, keep=12)
-        self.call_from_thread(self._after_search, pid)
+        self.matches[key].candidates = candidates
+        self.call_from_thread(self._after_search, key)
 
-    def _after_search(self, pid: str) -> None:
-        self.store.save_matches(self.matches)
-        if self.current == pid:
-            self.show_track(pid)
+    def _after_search(self, key: str) -> None:
+        self.src.save()
+        if self.current == key:
+            self.show_item(key)
             self.query_one("#candidates", OptionList).focus()
 
     # --- actions ------------------------------------------------------------
@@ -181,7 +281,7 @@ class ReviewApp(App[None]):
         self._commit()
 
     def _commit(self) -> None:
-        self.store.save_matches(self.matches)
+        self.src.save()
         cur = self.current
         self.refresh_table(keep=cur if self.show_all else None)
         self.query_one("#tracks", DataTable).focus()
@@ -212,10 +312,9 @@ class ReviewApp(App[None]):
     def action_search(self) -> None:
         if not self.current:
             return
-        tr = self.lib.tracks[self.current]
         inp = self.query_one("#search", Input)
         inp.add_class("visible")
-        inp.value = f"{matching.clean_title(tr.name)} {matching.primary_artist(tr.artist)}".strip()
+        inp.value = self.src.default_query(self.current)
         inp.focus()
 
     def action_toggle_all(self) -> None:

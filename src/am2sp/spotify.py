@@ -2,7 +2,9 @@
 
 Targets the endpoints as they exist for Development Mode apps after the February 2026
 migration: `POST /me/playlists`, `POST /playlists/{id}/items`, `PUT /me/library` (URIs in the
-query string, max 40), `GET /search` (limit max 10).
+query string, max 40), `GET /search` (limit max 10). Reads: `GET /me/playlists`,
+`GET /playlists/{id}/items` (entries carry `item`, not `track`), `GET /me/albums`, `GET /albums/{id}/tracks`.
+`PUT /me/library` also saves albums (`spotify:album:` URIs).
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 DEFAULT_REDIRECT = "http://127.0.0.1:8888/callback"
 SCOPES = [
+    "user-read-private",  # needed for market=from_token on /search and /tracks
     "user-library-read",
     "user-library-modify",
     "user-follow-modify",  # listed as required by PUT /me/library
@@ -35,6 +38,7 @@ SCOPES = [
     "playlist-modify-public",
 ]
 SEARCH_LIMIT = 10
+MAX_RETRY_WAIT = 60  # seconds; a longer Retry-After (quota exhausted) raises RateLimitError instead of sleeping
 LIBRARY_BATCH = 40
 PLAYLIST_BATCH = 100
 
@@ -43,6 +47,18 @@ CONFIG_DIR = Path(os.environ.get("AM2SP_CONFIG_DIR", Path.home() / ".config" / "
 
 class SpotifyError(RuntimeError):
     pass
+
+
+class RateLimitError(SpotifyError):
+    """Spotify asked us to back off for longer than is worth sleeping through (e.g. daily quota exceeded)."""
+
+    def __init__(self, retry_after: int):
+        self.retry_after = retry_after
+        until = time.strftime("%a %H:%M", time.localtime(time.time() + retry_after))
+        super().__init__(
+            f"Spotify rate limit: asked to wait {retry_after // 3600}h{retry_after % 3600 // 60:02d}m "
+            f"(until about {until}). Progress is saved; re-run the same command then."
+        )
 
 
 def _client_id() -> str:
@@ -191,7 +207,10 @@ class Spotify:
                 self._refresh()
                 continue
             if r.status_code == 429:
-                time.sleep(int(r.headers.get("Retry-After", "2")) + 1)
+                wait = int(r.headers.get("Retry-After", "2"))
+                if wait > MAX_RETRY_WAIT:
+                    raise RateLimitError(wait)
+                time.sleep(wait + 1)
                 continue
             if r.status_code >= 500:
                 time.sleep(2**attempt)
@@ -217,6 +236,20 @@ class Spotify:
     def get_track(self, track_id: str) -> dict[str, Any]:
         return self.request("GET", f"/tracks/{track_id}", params={"market": "from_token"}).json()
 
+    def search_albums(self, q: str) -> list[dict[str, Any]]:
+        r = self.request(
+            "GET",
+            "/search",
+            params={"q": q, "type": "album", "limit": SEARCH_LIMIT, "market": "from_token"},
+        )
+        return [a for a in r.json().get("albums", {}).get("items", []) if a]
+
+    def get_album(self, album_id: str) -> dict[str, Any]:
+        return self.request("GET", f"/albums/{album_id}", params={"market": "from_token"}).json()
+
+    def album_tracks(self, album_id: str) -> list[dict[str, Any]]:
+        return self._paginate(f"/albums/{album_id}/tracks", {"limit": 50, "market": "from_token"})
+
     def create_playlist(self, name: str, description: str = "", public: bool = False) -> dict[str, Any]:
         body = {"name": name, "public": public, "description": description[:300]}
         return self.request("POST", "/me/playlists", json=body).json()
@@ -237,3 +270,33 @@ class Spotify:
     def save_to_library(self, uris: list[str]) -> None:
         for i in range(0, len(uris), LIBRARY_BATCH):
             self.request("PUT", "/me/library", params={"uris": ",".join(uris[i : i + LIBRARY_BATCH])})
+
+    # --- reading what's already on the account ----------------------------
+
+    def _paginate(self, path: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        """Collect `items` across pages by following `next` (an absolute URL with offset/limit baked in)."""
+        out: list[dict[str, Any]] = []
+        url: str | None = path
+        while url:
+            page = self.request("GET", url, params=params if url == path else None).json()
+            out.extend(page.get("items") or [])
+            url = page.get("next")
+        return out
+
+    def saved_albums(self) -> list[dict[str, Any]]:
+        """Albums in Library → Albums, as Spotify album objects (`GET /me/albums` is still readable)."""
+        return [it["album"] for it in self._paginate("/me/albums", {"limit": 50}) if (it.get("album") or {}).get("uri")]
+
+    def my_playlists(self) -> list[dict[str, Any]]:
+        """Playlists owned by the current user (followed ones are left out: their items can't be read)."""
+        me = self.me()["id"]
+        return [p for p in self._paginate("/me/playlists", {"limit": 50}) if p and p.get("owner", {}).get("id") == me]
+
+    def playlist_items(self, playlist_id: str) -> list[dict[str, Any]]:
+        """Tracks in an owned playlist. Entries carry `item` since Feb 2026 (`track` before); episodes are dropped."""
+        out = []
+        for it in self._paginate(f"/playlists/{playlist_id}/items", {"limit": 100}):
+            t = it.get("item") or it.get("track") or {}
+            if t.get("type", "track") == "track" and t.get("uri", "").startswith("spotify:track:"):
+                out.append(t)
+        return out
